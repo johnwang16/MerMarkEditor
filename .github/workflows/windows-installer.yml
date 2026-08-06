@@ -1,0 +1,171 @@
+name: Windows Installer (x64)
+
+# Standalone Windows-only bundle pipeline for this fork.
+#
+# Deliberately separate from release.yml so upstream changes to that file merge
+# cleanly. Unlike release.yml this workflow never bumps versions, never commits,
+# and never pushes — it only ever reads the tree it was triggered on.
+#
+# Runs with zero repository secrets configured. See "Patch bundle config" below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Also attach installers to a GitHub Release (run this from a tag)'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# A re-push of the same tag supersedes the first; in-flight runs are wasted work.
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      # Ordering matters: setup-node's pnpm cache resolves the store path by shelling
+      # out to pnpm, so pnpm has to already be on PATH.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The committed tauri.conf.json pairs an updater pubkey with
+      # createUpdaterArtifacts: true. The bundler treats "public key present, private
+      # key absent" as a hard error, and the matching TAURI_SIGNING_PRIVATE_KEY only
+      # exists in the upstream repo — so an unmodified build cannot succeed in a fork.
+      #
+      # This patches the checked-out working copy only; it is never committed, so
+      # tauri.conf.json stays byte-identical to upstream and keeps merging cleanly.
+      # Done as an explicit step rather than a `tauri build --config '{...}'` override
+      # because inline JSON has to survive YAML folding and Windows shell quoting.
+      #
+      # targets is narrowed from "all" to the two Windows installers we ship.
+      - name: Patch bundle config for unsigned fork build
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = "src-tauri/tauri.conf.json";
+            const c = JSON.parse(fs.readFileSync(p, "utf8"));
+            c.bundle.createUpdaterArtifacts = false;
+            c.bundle.targets = ["nsis", "msi"];
+            fs.writeFileSync(p, JSON.stringify(c, null, 2));
+            console.log("bundle.targets =", c.bundle.targets.join(", "));
+            console.log("bundle.createUpdaterArtifacts =", c.bundle.createUpdaterArtifacts);
+          '
+          git diff --stat src-tauri/tauri.conf.json
+
+      - name: Build and bundle x64 installers
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --- Code signing (builds are currently unsigned) ---
+          # Installers without a certificate trigger a SmartScreen warning. To sign:
+          #   1. Add secrets WINDOWS_CERTIFICATE (base64 .pfx) and
+          #      WINDOWS_CERTIFICATE_PASSWORD.
+          #   2. Uncomment the two env lines below.
+          #   3. In the patch step above, set:
+          #        c.bundle.windows.certificateThumbprint = "<thumbprint>";
+          #        c.bundle.windows.timestampUrl = "http://timestamp.digicert.com";
+          # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        with:
+          args: --target ${{ env.RUST_TARGET }}
+
+      # tauri-action can exit 0 having produced a bundle that is missing, truncated, or
+      # built for the wrong architecture. Assert the shape of what we ship rather than
+      # trusting the exit code.
+      - name: Verify installers are x64 and non-trivial
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = "src-tauri/target/$env:RUST_TARGET/release/bundle"
+
+          $installers = @(
+            @{ Name = 'NSIS'; Path = "$bundle/nsis"; Ext = '*.exe' },
+            @{ Name = 'MSI';  Path = "$bundle/msi";  Ext = '*.msi' }
+          )
+
+          foreach ($i in $installers) {
+            $file = Get-ChildItem -Path $i.Path -Filter $i.Ext -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+            if (-not $file) {
+              Write-Output "::error::No $($i.Name) installer found under $($i.Path)"
+              exit 1
+            }
+            if ($file.Length -lt 1MB) {
+              Write-Output "::error::$($file.Name) is $($file.Length) bytes - truncated bundle"
+              exit 1
+            }
+            Write-Output "$($i.Name): $($file.Name) ($([math]::Round($file.Length/1MB,1)) MB)"
+          }
+
+          # The NSIS installer is a PE binary; confirm its COFF machine field says x64.
+          # An MSI is an OLE compound file with no PE header, so it is not checked here.
+          $exe = Get-ChildItem -Path "$bundle/nsis" -Filter '*.exe' | Select-Object -First 1
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) {
+            Write-Output ("::error::{0} machine type is 0x{1:X4}, expected 0x8664 (x64)" -f $exe.Name, $machine)
+            exit 1
+          }
+          Write-Output "PE machine type: 0x8664 (x64) - OK"
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: mermark-editor-windows-x64
+          path: |
+            src-tauri/target/${{ env.RUST_TARGET }}/release/bundle/nsis/*.exe
+            src-tauri/target/${{ env.RUST_TARGET }}/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 30
+
+      # Guarded on a tag ref so a manual run from a branch cannot create a release
+      # named after that branch.
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') && (github.event_name == 'push' || inputs.publish_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MerMark Editor ${{ github.ref_name }} (Windows x64)
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/${{ env.RUST_TARGET }}/release/bundle/nsis/*.exe
+            src-tauri/target/${{ env.RUST_TARGET }}/release/bundle/msi/*.msi
